@@ -1,10 +1,10 @@
 '''
-Descripttion: The scripts used to generate the input file graph_data.npz for HamGNN.
+Descripttion: The scripts used to generate the input file graph_data.npz for HamNet.
 version: 0.1
 Author: Yang Zhong
 Date: 2022-11-24 19:07:54
 LastEditors: Yang Zhong
-LastEditTime: 2023-12-18 16:13:22
+LastEditTime: 2023-01-16 14:52:09
 '''
 
 import json
@@ -18,357 +18,221 @@ import natsort
 from tqdm import tqdm
 import re
 from pymatgen.core.periodic_table import Element
-from utils_openmx.utils import *
-import argparse
-import yaml
+from utils import *
+from scipy.optimize import curve_fit
 
-def main():
-    parser = argparse.ArgumentParser(description='graph data generation')
-    parser.add_argument('--config', default='graph_data_gen.yaml', type=str, metavar='N')
-    args = parser.parse_args()
+################################ Input parameters begin ####################
+nao_max = 19  # maximum number of atomic orbitals
+graph_data_path = '/public/home/cwzhang/acd47nd21x/zhangchangwei/HamNet/graph'  # path to save the graph data
+read_openmx_path = '.'  # path of a binary executable "read_openmx"
+max_SCF_skip = 200 # default is 200
+scfout_paths = "/public/home/cwzhang/acd47nd21x/zhangchangwei/HamNet/PC/" # "/data/home/yzhong/EPC_test/MoS2_calculated/MoS2_*/"  # path of the DFT output
+dat_file_name = "Si.dat"  # name of the dat file for DFT
+std_file_name = "log"
+scfout_file_name = "Si.scfout"  # name of the scfout file of DFT
+weight_hamiltonian = True  # whether to weight to off-site hamiltonian through distance
+weight_param = "fit"  # parameter used in the weight
+################################ Input parameters end ######################
+
+
+def calculate_weight(data_set, a="fit"):
+    '''Calculate the weight applied to each matrix element.
+    A weight proportional to exp(-a*rij) is added to each off-site matrices.
+    The weights are normalized so that the maximum weight equals 1.'''
+    # Extract rij and off-site H data
+    dist_all = []
+    n_edge_all = []  # n_edge_all[i] is the n_edge of struct i
+    Hoff_mean_all = []
+    for sample in list(data_set.values()):
+        Hoff = torch.abs(sample["Hoff"]).numpy()
+        Hoff = np.ma.masked_equal(Hoff, 0.0)  # omit the unused orbitals
+        Hoff_mean = torch.FloatTensor(np.mean(Hoff, axis=1))
+        # Hoff_mean = torch.mean(torch.abs(sample["Hoff"]), dim=1)  # mean abs value of off site sub matrix
+        Hoff_mean_all.append(Hoff_mean)
+        src_node_pos = sample["pos"][sample["edge_index"][0]]
+        tgt_node_pos = sample["pos"][sample["edge_index"][1]]  # (n_edge, 3)
+        tgt_node_pos += sample["nbr_shift"]  # (n_edge, 3)
+        rel_pos = tgt_node_pos - src_node_pos  # relative offsite vector
+        dist = torch.linalg.norm(rel_pos, dim=1)  # distance between 2 atoms
+        dist_all.append(dist)
+        n_edge_all.append(sample["edge_index"].shape[1])
+
+    Hoff_mean_all = torch.cat(Hoff_mean_all)
+    dist_all = torch.cat(dist_all)
+    # print(Hoff_mean_all.shape)
+
+    if a == "fit":  # fit a
+        def exp_fit(x, A, a):
+            return A * np.exp(-a * x)
+
+        popt, pcov = curve_fit(exp_fit, dist_all.numpy(), Hoff_mean_all.numpy())
+        rmse = np.sqrt(torch.sum(torch.abs(Hoff_mean_all - exp_fit(dist_all, *popt))**2) / len(dist_all))
+        a = popt[1]  # coeff in the weight
+        print(f"The target Hamiltonian is used to fit the weights, with a={a}, and rmse={rmse}.")
+
+    # weight the Hamiltonian
+    weights = torch.exp(-a * dist_all)
+    weights = weights / torch.max(weights)  # normalization
+    assert torch.all(weights > 0)
+    idx = 0
+    for i in range(len(data_set)):
+        weight_i = weights[idx: idx+n_edge_all[i]]
+        # assert len(weight_i) == data_set[i].edge_index.shape[1]
+        data_set[i].weights = weight_i.reshape(-1, 1).contiguous()
+        weighted_Hoff = (data_set[i].weights * data_set[i].Hoff)
+        data_set[i].weighted_hamiltonian = torch.cat([data_set[i].Hon, weighted_Hoff]).contiguous()
+
+
+
+if nao_max == 14:
+    basis_def = basis_def_14  # defined in utils.py
+elif nao_max == 19:
+    basis_def = basis_def_19
+else:
+    raise NotImplementedError
+
+graphs = dict()
+if not os.path.exists(graph_data_path):
+    os.makedirs(graph_data_path)
+scfout_paths = glob.glob(scfout_paths)  # glob returns a list of pathnames matching the pattern given in scfout_paths
+scfout_paths = natsort.natsorted(scfout_paths)  # natsort sorts a string list with human-friendly order (numbers sorted correctly)
+
+for idx, scf_path in enumerate(tqdm(scfout_paths)):  # tqdm creates a progress bar on stdout
+    # file paths
+    f_sc = os.path.join(scf_path, scfout_file_name)
+    f_std = os.path.join(scf_path, std_file_name)
+    f_dat = os.path.join(scf_path, dat_file_name)
+    f_H0 = os.path.join(scf_path, "overlap.scfout")
     
-    with open(args.config, encoding='utf-8') as rstream:
-        input = yaml.load(rstream, yaml.SafeLoader)
-    ################################ Input parameters begin ####################
-    nao_max = input['nao_max']
-    graph_data_path = input['graph_data_save_path']
-    read_openmx_path = input['read_openmx_path']
-    if os.path.isdir(read_openmx_path):
-        read_openmx_path = os.path.join(read_openmx_path, 'read_openmx')
-    max_SCF_skip = input['max_SCF_skip']
-    scfout_paths = input['scfout_paths'] # The directory of the .scfout file calculated by openmx/openmx_postprocess, or a wildcard directory name to match multiple directories
-    dat_file_name = input['dat_file_name']
-    std_file_name = input['std_file_name'] # None if no openmx computation is performed
-    scfout_file_name = input['scfout_file_name'] # If the openmx self-consistent Hamiltonian is not required as the target, "overlap.scfout" can be used instead.
-    soc_switch = input['soc_switch'] # generate graph_data.npz for SOC (True) or Non-SOC (False) Hamiltonian
-    ################################ Input parameters end ######################
+    # read energy
+    try:
+        with open(f_std, 'r') as f:
+            content = f.read()
+            Enpy = float(pattern_eng.findall((content).strip())[0][-1])
+            max_SCF = int(pattern_md.findall((content).strip())[-1][-1])
+    except:
+        continue
     
-    if nao_max == 14:
-        basis_def = basis_def_14
-    elif nao_max == 19:
-        basis_def = basis_def_19
-    elif nao_max == 26:
-        basis_def = basis_def_26
-    else:
-        raise NotImplementedError
+    # check if the calculation is converged
+    if max_SCF > max_SCF_skip:
+        continue  
     
-    graphs = dict()
-    if not os.path.exists(graph_data_path):
-        os.makedirs(graph_data_path)
-    scfout_paths = glob.glob(scfout_paths)
-    scfout_paths = natsort.natsorted(scfout_paths)
+    # Read crystal parameters
+    try:
+        with open(f_dat,'r') as f:
+            content = f.read()
+            speciesAndCoordinates = pattern_coor.findall((content).strip())
+            latt = pattern_latt.findall((content).strip())[0]
+            latt = np.array([float(var) for var in latt]).reshape(-1, 3)/au2ang
     
-    for idx, scf_path in enumerate(tqdm(scfout_paths)):
-        # file paths
-        f_sc = os.path.join(scf_path, scfout_file_name)
-        f_dat = os.path.join(scf_path, dat_file_name)
-        f_H0 = os.path.join(scf_path, "overlap.scfout")
-        
-        # read energy
-        if std_file_name is not None:   
-            f_std = os.path.join(scf_path, std_file_name) 
-            try:
-                with open(f_std, 'r') as f:
-                    content = f.read()
-                    Enpy = float(pattern_eng.findall((content).strip())[0][-1])
-                    max_SCF = int(pattern_md.findall((content).strip())[-1][-1])
-            except:
-                continue
-        else:
-            Enpy = 0.0
-            max_SCF = 1
-
-        
-        # check if the calculation is converged
-        if max_SCF > max_SCF_skip:
-            continue  
-        
-        # Read crystal parameters
-        try:
-            with open(f_dat,'r') as f:
-                content = f.read()
-                speciesAndCoordinates = pattern_coor.findall((content).strip())
-                latt = pattern_latt.findall((content).strip())[0]
-                latt = np.array([float(var) for var in latt]).reshape(-1, 3)/au2ang
-        
-                species = []
-                coordinates = []
-                for item in speciesAndCoordinates:
-                    species.append(item[0])
-                    coordinates += item[1:]
-                z = atomic_numbers = np.array([Element[s].Z for s in species])
-                coordinates = np.array([float(pos) for pos in coordinates]).reshape(-1, 3)/au2ang
-        except:
-            continue
-        
-        if soc_switch:
-            # read hopping parameters
-            os.system(read_openmx_path + " " + f_sc)
-            if not os.path.exists("./HS.json"):
-                continue
-            
-            with open("./HS.json",'r') as load_f:
-                try:
-                    load_dict = json.load(load_f)
-                except:
-                    print(f'{f_sc} is not read successfully!')
-                    continue
-                pos = np.array(load_dict['pos'])
-                edge_index = np.array(load_dict['edge_index'])
-                inv_edge_idx = np.array(load_dict['inv_edge_idx'])
-                #
-                Hon = load_dict['Hon']
-                Hoff = load_dict['Hoff']
-                iHon = load_dict['iHon']
-                iHoff = load_dict['iHoff']
-                Son = load_dict['Son']
-                Soff = load_dict['Soff']
-                nbr_shift = np.array(load_dict['nbr_shift'])
-                cell_shift = np.array(load_dict['cell_shift'])
-
-                if len(inv_edge_idx) != len(edge_index[0]):
-                    print('Wrong info: len(inv_edge_idx) != len(edge_index[0]) !')
-                    quit()
-
-                # Initialize Hks and iHks 
-                num_sub_matrix = pos.shape[0] + edge_index.shape[1]
-                Hks = np.zeros((num_sub_matrix, 4, nao_max**2))   
-                iHks = np.zeros((num_sub_matrix, 3, nao_max**2))
-                S = np.zeros((num_sub_matrix, nao_max**2))
-
-                # on-site
-                for iatm in range(len(z)):
-                    mask = np.zeros((nao_max, nao_max), dtype=int)
-                    src = z[iatm]
-                    mask[basis_def[src][:,None], basis_def[src][None,:]] = 1
-                    mask = (mask > 0).reshape(-1)
-                    S[iatm][mask] = np.array(Son[iatm])
-                    for i in range(4):
-                        Hks[iatm, i][mask] = np.array(Hon[i][iatm]) 
-                    for i in range(3):
-                        iHks[iatm, i][mask] = np.array(iHon[i][iatm])    
-
-                # off-site
-                for iedge in range(len(edge_index[0])):
-                    mask = np.zeros((nao_max, nao_max), dtype=int)
-                    src, tar = z[edge_index[0, iedge]], z[edge_index[1, iedge]]
-                    mask[basis_def[src][:,None], basis_def[tar][None,:]] = 1
-                    mask = (mask > 0).reshape(-1)
-                    S[len(z)+iedge][mask] = np.array(Soff[iedge])
-                    for i in range(4):
-                        Hks[iedge + len(z), i][mask] = np.array(Hoff[i][iedge]) 
-                    for i in range(3):
-                        iHks[iedge + len(z), i][mask] = np.array(iHoff[i][iedge])
-                #
-                hamiltonian_real = np.zeros((num_sub_matrix, 2*nao_max, 2*nao_max)) 
-                hamiltonian_real[:,:nao_max,:nao_max] = Hks[:,0,:].reshape(-1, nao_max, nao_max)
-                hamiltonian_real[:,:nao_max, nao_max:] = Hks[:,2,:].reshape(-1,nao_max, nao_max)
-                hamiltonian_real[:,nao_max:,:nao_max] = Hks[:,2,:].reshape(-1,nao_max, nao_max)
-                hamiltonian_real[:,nao_max:,nao_max:] = Hks[:,1,:].reshape(-1,nao_max, nao_max)
-                hamiltonian_real = hamiltonian_real.reshape(-1, (2*nao_max)**2)
-
-                hamiltonian_imag = np.zeros((num_sub_matrix, 2*nao_max, 2*nao_max)) 
-                hamiltonian_imag[:,:nao_max,:nao_max] = iHks[:,0,:].reshape(-1, nao_max, nao_max)
-                hamiltonian_imag[:,:nao_max, nao_max:] = (Hks[:,3,:] + iHks[:,2,:]).reshape(-1, nao_max, nao_max)
-                hamiltonian_imag[:,nao_max:,:nao_max] = -(Hks[:,3,:] + iHks[:,2,:]).reshape(-1, nao_max, nao_max)
-                hamiltonian_imag[:,nao_max:,nao_max:] = iHks[:,1,:].reshape(-1, nao_max, nao_max)
-                hamiltonian_imag = hamiltonian_imag.reshape(-1, (2*nao_max)**2)
-            os.system("rm HS.json")
-
-            # read H0
-            os.system(read_openmx_path + " " + f_H0)
-            if not os.path.exists("./HS.json"):
-                continue
-            
-            with open("./HS.json",'r') as load_f:
-                try:
-                    load_dict = json.load(load_f)
-                except:
-                    print(f'{f_H0} is not read successfully!')
-                    continue
-                #
-                Hon0 = load_dict['Hon']
-                Hoff0 = load_dict['Hoff']
-                iHon0 = load_dict['iHon']
-                iHoff0 = load_dict['iHoff']
-                Lon = load_dict['Lon']
-                Loff = load_dict['Loff']
-
-                # initialize Hks0 and iHks0
-                num_sub_matrix = pos.shape[0] + edge_index.shape[1]
-                Hks0 = np.zeros((num_sub_matrix, 4, nao_max**2))   
-                iHks0 = np.zeros((num_sub_matrix, 3, nao_max**2))
-                L = np.zeros((num_sub_matrix, nao_max**2, 3))
-
-                # on-site
-                for iatm in range(len(z)):
-                    mask = np.zeros((nao_max, nao_max), dtype=int)
-                    src = z[iatm]
-                    mask[basis_def[src][:,None], basis_def[src][None,:]] = 1
-                    mask = (mask > 0).reshape(-1)
-                    L[iatm][mask] = np.array(Lon[iatm])
-                    for i in range(4):
-                        Hks0[iatm, i][mask] = np.array(Hon0[i][iatm]) 
-                    for i in range(3):
-                        iHks0[iatm, i][mask] = np.array(iHon0[i][iatm])    
-
-                # off-site
-                for iedge in range(len(edge_index[0])):
-                    mask = np.zeros((nao_max, nao_max), dtype=int)
-                    src, tar = z[edge_index[0, iedge]], z[edge_index[1, iedge]]
-                    mask[basis_def[src][:,None], basis_def[tar][None,:]] = 1
-                    mask = (mask > 0).reshape(-1)
-                    L[len(z)+iedge][mask] = np.array(Loff[iedge])
-                    for i in range(4):
-                        Hks0[iedge + len(z), i][mask] = np.array(Hoff0[i][iedge]) 
-                    for i in range(3):
-                        iHks0[iedge + len(z), i][mask] = np.array(iHoff0[i][iedge])
-
-                hamiltonian_real0 = np.zeros((num_sub_matrix, 2*nao_max, 2*nao_max)) 
-                hamiltonian_real0[:,:nao_max,:nao_max] = Hks0[:,0,:].reshape(-1, nao_max, nao_max)
-                hamiltonian_real0[:,:nao_max, nao_max:] = Hks0[:,2,:].reshape(-1,nao_max, nao_max)
-                hamiltonian_real0[:,nao_max:,:nao_max] = Hks0[:,2,:].reshape(-1,nao_max, nao_max)
-                hamiltonian_real0[:,nao_max:,nao_max:] = Hks0[:,1,:].reshape(-1,nao_max, nao_max)
-                hamiltonian_real0 = hamiltonian_real0.reshape(-1, (2*nao_max)**2)
-
-                hamiltonian_imag0 = np.zeros((num_sub_matrix, 2*nao_max, 2*nao_max)) 
-                hamiltonian_imag0[:,:nao_max,:nao_max] = iHks0[:,0,:].reshape(-1, nao_max, nao_max)
-                hamiltonian_imag0[:,:nao_max, nao_max:] = (Hks0[:,3,:] + iHks0[:,2,:]).reshape(-1, nao_max, nao_max)
-                hamiltonian_imag0[:,nao_max:,:nao_max] = -(Hks0[:,3,:] + iHks0[:,2,:]).reshape(-1, nao_max, nao_max)
-                hamiltonian_imag0[:,nao_max:,nao_max:] = iHks0[:,1,:].reshape(-1, nao_max, nao_max)
-                hamiltonian_imag0 = hamiltonian_imag0.reshape(-1, (2*nao_max)**2)
-            os.system("rm HS.json")
-
-            graphs[idx] = Data(z=torch.LongTensor(z),
-                                cell = torch.Tensor(latt[None,:,:]),
-                                total_energy=Enpy,
-                                pos=torch.FloatTensor(pos),
-                                node_counts=torch.LongTensor([len(z)]),
-                                edge_index=torch.LongTensor(edge_index),
-                                inv_edge_idx=torch.LongTensor(inv_edge_idx),
-                                nbr_shift=torch.FloatTensor(nbr_shift),
-                                cell_shift=torch.LongTensor(cell_shift),
-                                Hon=torch.FloatTensor(hamiltonian_real[:len(z),:]),
-                                Hoff=torch.FloatTensor(hamiltonian_real[len(z):,:]),
-                                iHon=torch.FloatTensor(hamiltonian_imag[:len(z),:]),
-                                iHoff=torch.FloatTensor(hamiltonian_imag[len(z):,:]),
-                                Hon0=torch.FloatTensor(hamiltonian_real0[:len(z),:]),
-                                Hoff0=torch.FloatTensor(hamiltonian_real0[len(z):,:]),
-                                iHon0=torch.FloatTensor(hamiltonian_imag0[:len(z),:]),
-                                iHoff0=torch.FloatTensor(hamiltonian_imag0[len(z):,:]),
-                                overlap=torch.FloatTensor(S),
-                                Son = torch.FloatTensor(S[:pos.shape[0],:]),
-                                Soff = torch.FloatTensor(S[pos.shape[0]:,:]),
-                                Lon = torch.FloatTensor(L[:pos.shape[0],:,:]),
-                                Loff = torch.FloatTensor(L[pos.shape[0]:,:,:]))
-        else:            
-            # read hopping parameters
-            os.system(read_openmx_path + " " + f_sc)
-            if not os.path.exists("./HS.json"):
-                continue
-            
-            with open("./HS.json",'r') as load_f:
-                try:
-                    load_dict = json.load(load_f)
-                except:
-                    print(f'{f_sc} is not read successfully!')
-                    continue
-                pos = np.array(load_dict['pos'])
-                edge_index = np.array(load_dict['edge_index'])
-                inv_edge_idx = np.array(load_dict['inv_edge_idx'])
-                #
-                Hon = load_dict['Hon'][0]
-                Hoff = load_dict['Hoff'][0]
-                Son = load_dict['Son']
-                Soff = load_dict['Soff']
-                nbr_shift = np.array(load_dict['nbr_shift'])
-                cell_shift = np.array(load_dict['cell_shift'])
-                
-                # Find inverse edge_index
-                if len(inv_edge_idx) != len(edge_index[0]):
-                    print('Wrong info: len(inv_edge_idx) != len(edge_index[0]) !')
-                    sys.exit()
-        
-                #
-                num_sub_matrix = pos.shape[0] + edge_index.shape[1]
-                H = np.zeros((num_sub_matrix, nao_max**2))
-                S = np.zeros((num_sub_matrix, nao_max**2))
-                
-                for i, (sub_maxtrix_H, sub_maxtrix_S) in enumerate(zip(Hon, Son)):
-                    mask = np.zeros((nao_max, nao_max), dtype=int)
-                    src = z[i]
-                    mask[basis_def[src][:,None], basis_def[src][None,:]] = 1
-                    mask = (mask > 0).reshape(-1)
-                    H[i][mask] = np.array(sub_maxtrix_H)
-                    S[i][mask] = np.array(sub_maxtrix_S)
-                
-                num = 0
-                for i, (sub_maxtrix_H, sub_maxtrix_S) in enumerate(zip(Hoff, Soff)):
-                    mask = np.zeros((nao_max, nao_max), dtype=int)
-                    src, tar = z[edge_index[0,num]], z[edge_index[1,num]]
-                    mask[basis_def[src][:,None], basis_def[tar][None,:]] = 1
-                    mask = (mask > 0).reshape(-1)
-                    H[num + len(z)][mask] = np.array(sub_maxtrix_H)
-                    S[num + len(z)][mask] = np.array(sub_maxtrix_S)
-                    num = num + 1
-            os.system("rm HS.json")
-            
-            # read H0
-            os.system(read_openmx_path + " " + f_H0)
-            if not os.path.exists("./HS.json"):
-                continue
-            
-            with open("./HS.json",'r') as load_f:
-                try:
-                    load_dict = json.load(load_f)
-                except:
-                    print(f'{f_H0} is not read successfully!')
-                    continue
-                Hon0 = load_dict['Hon'][0]
-                Hoff0 = load_dict['Hoff'][0]
-        
-                #
-                num_sub_matrix = pos.shape[0] + edge_index.shape[1]
-                H0 = np.zeros((num_sub_matrix, nao_max**2))
-                
-                for i, sub_maxtrix_H in enumerate(Hon0):
-                    mask = np.zeros((nao_max, nao_max), dtype=int)
-                    src = z[i]
-                    mask[basis_def[src][:,None], basis_def[src][None,:]] = 1
-                    mask = (mask > 0).reshape(-1)
-                    H0[i][mask] = np.array(sub_maxtrix_H)
-                
-                num = 0
-                for i, sub_maxtrix_H in enumerate(Hoff0):
-                    mask = np.zeros((nao_max, nao_max), dtype=int)
-                    src, tar = z[edge_index[0,num]], z[edge_index[1,num]]
-                    mask[basis_def[src][:,None], basis_def[tar][None,:]] = 1
-                    mask = (mask > 0).reshape(-1)
-                    H0[num + len(z)][mask] = np.array(sub_maxtrix_H)
-                    num = num + 1
-            os.system("rm HS.json")
-            
-            # save in Data
-            graphs[idx] = Data(z=torch.LongTensor(z),
-                                cell = torch.Tensor(latt[None,:,:]),
-                                total_energy=Enpy,
-                                pos=torch.FloatTensor(pos),
-                                node_counts=torch.LongTensor([len(z)]),
-                                edge_index=torch.LongTensor(edge_index),
-                                inv_edge_idx=torch.LongTensor(inv_edge_idx),
-                                nbr_shift=torch.FloatTensor(nbr_shift),
-                                cell_shift=torch.LongTensor(cell_shift),
-                                hamiltonian=torch.FloatTensor(H),
-                                overlap=torch.FloatTensor(S),
-                                Hon = torch.FloatTensor(H[:pos.shape[0],:]),
-                                Hoff = torch.FloatTensor(H[pos.shape[0]:,:]),
-                                Hon0 = torch.FloatTensor(H0[:pos.shape[0],:]),
-                                Hoff0 = torch.FloatTensor(H0[pos.shape[0]:,:]),
-                                Son = torch.FloatTensor(S[:pos.shape[0],:]),
-                                Soff = torch.FloatTensor(S[pos.shape[0]:,:]))
+            species = []
+            coordinates = []
+            for item in speciesAndCoordinates:
+                species.append(item[0])
+                coordinates += item[1:]
+            z = atomic_numbers = np.array([Element[s].Z for s in species])  # Z number (species) for each atom
+            coordinates = np.array([float(pos) for pos in coordinates]).reshape(-1, 3)/au2ang
+    except:
+        continue
     
-    graph_data_path = os.path.join(graph_data_path, 'graph_data.npz')
-    np.savez(graph_data_path, graph=graphs)
+    # read H & S
+    os.system(os.path.join(read_openmx_path, 'read_openmx') + " " + f_sc)  # an executable read_openmx will run to create the json
+    if not os.path.exists("./HS.json"):
+        continue
+    
+    with open("./HS.json",'r') as load_f:
+        load_dict = json.load(load_f)
+        pos = np.array(load_dict['pos'])  # (n_atoms, 3)  # pos of atoms
+        edge_index = np.array(load_dict['edge_index'])  # (2, n_edges), each col is source node idx &  dest node idx
+        inv_edge_idx = np.array(load_dict['inv_edge_idx'])  # (n_edges), each elem is the idx of edge in the edge_idx
+        #
+        Hon = load_dict['Hon'][0]  # on-site Hamiltonian with n_atoms sub matrices, each of size (n_orb, n_orb) (n_orb may differ from each other)
+        Hoff = load_dict['Hoff'][0]  # off-site Hamiltonian with n_edges sub matries, each of size (n_orb_src, n_orb_dest)
+        Son = load_dict['Son']  # overlap matrices
+        Soff = load_dict['Soff']
+        nbr_shift = np.array(load_dict['nbr_shift'])  # (n_edges, 3) nbr_shift[i]= shift vector that is added to the position of the destination node of the edge with index i to obtain the position of its neighbor
+        cell_shift = np.array(load_dict['cell_shift'])  # (n_edges, 3)
+        
+        # Find inverse edge_index
+        if len(inv_edge_idx) != len(edge_index[0]):
+            print('Wrong info: len(inv_edge_idx) != len(edge_index[0]) !')
+            sys.exit()
 
-if __name__ == '__main__':
-    main()
+        # expand the submatrices to nao_max**2
+	# e.g.: CH4, C use s1p1, but H use s1. Submatrices are expanded to 13*13 as if all s1s2p1p2d1 is used
+        num_sub_matrix = pos.shape[0] + edge_index.shape[1]  # n_atoms + n_edges
+        H = np.zeros((num_sub_matrix, nao_max**2))  # each submatrices expanded to nao_max**2
+        S = np.zeros((num_sub_matrix, nao_max**2))
+        
+        for i, (sub_maxtrix_H, sub_maxtrix_S) in enumerate(zip(Hon, Son)):  # onsite
+            mask = np.zeros((nao_max, nao_max), dtype=int)
+            src = z[i]  # z is atomic number (species)
+            mask[basis_def[src][:,None], basis_def[src][None,:]] = 1  # The 1 elements correspond to used orbits
+            mask = (mask > 0).reshape(-1)
+            H[i][mask] = np.array(sub_maxtrix_H)  # sub_matrix_H is put into the  used orbits of H
+            S[i][mask] = np.array(sub_maxtrix_S)
+        
+        num = 0
+        for i, (sub_maxtrix_H, sub_maxtrix_S) in enumerate(zip(Hoff, Soff)): # offsite
+            mask = np.zeros((nao_max, nao_max), dtype=int)
+            src, tar = z[edge_index[0,num]], z[edge_index[1,num]]  # z number of src and target
+            mask[basis_def[src][:,None], basis_def[tar][None,:]] = 1
+            mask = (mask > 0).reshape(-1)
+            H[num + len(z)][mask] = np.array(sub_maxtrix_H)  # off site matrices are stored after the len(z) onsite mats
+            S[num + len(z)][mask] = np.array(sub_maxtrix_S)
+            num = num + 1
+    os.system("rm HS.json")
+    
+    # read H0
+    os.system(os.path.join(read_openmx_path, 'read_openmx') + " " + f_H0)
+    if not os.path.exists("./HS.json"):
+        continue
+    
+    with open("./HS.json",'r') as load_f:
+        load_dict = json.load(load_f)
+        Hon0 = load_dict['Hon'][0]
+        Hoff0 = load_dict['Hoff'][0]
+
+        #
+        num_sub_matrix = pos.shape[0] + edge_index.shape[1]
+        H0 = np.zeros((num_sub_matrix, nao_max**2))
+        
+        for i, sub_maxtrix_H in enumerate(Hon0):
+            mask = np.zeros((nao_max, nao_max), dtype=int)
+            src = z[i]
+            mask[basis_def[src][:,None], basis_def[src][None,:]] = 1
+            mask = (mask > 0).reshape(-1)
+            H0[i][mask] = np.array(sub_maxtrix_H)
+        
+        num = 0
+        for i, sub_maxtrix_H in enumerate(Hoff0):
+            mask = np.zeros((nao_max, nao_max), dtype=int)
+            src, tar = z[edge_index[0,num]], z[edge_index[1,num]]
+            mask[basis_def[src][:,None], basis_def[tar][None,:]] = 1
+            mask = (mask > 0).reshape(-1)
+            H0[num + len(z)][mask] = np.array(sub_maxtrix_H)
+            num = num + 1
+    os.system("rm HS.json")
+    
+    # save in Data
+    graphs[idx] = Data(z=torch.LongTensor(z),
+                        cell = torch.Tensor(latt[None,:,:]),
+                        total_energy=Enpy,
+                        pos=torch.FloatTensor(pos),
+                        node_counts=torch.LongTensor([len(z)]),
+                        edge_index=torch.LongTensor(edge_index),
+                        inv_edge_idx=torch.LongTensor(inv_edge_idx),
+                        nbr_shift=torch.FloatTensor(nbr_shift),
+                        cell_shift=torch.LongTensor(cell_shift),
+                        hamiltonian=torch.FloatTensor(H),
+                        overlap=torch.FloatTensor(S),
+                        Hon = torch.FloatTensor(H[:pos.shape[0],:]),
+                        Hoff = torch.FloatTensor(H[pos.shape[0]:,:]),
+                        Hon0 = torch.FloatTensor(H0[:pos.shape[0],:]),
+                        Hoff0 = torch.FloatTensor(H0[pos.shape[0]:,:]),
+                        Son = torch.FloatTensor(S[:pos.shape[0],:]),
+                        Soff = torch.FloatTensor(S[pos.shape[0]:,:]))
+if weight_haimltonian:
+    calculate_weight(graphs, a=weight_param)
+graph_data_path = os.path.join(graph_data_path, 'graph_data.npz')
+np.savez(graph_data_path, graph=graphs)
