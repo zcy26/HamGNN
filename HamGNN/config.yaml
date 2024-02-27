@@ -1,33 +1,44 @@
 dataset_params:
   batch_size: 1
+  database_type: db
+  max_num_nbr: 32
+  radius: 6.0
   split_file: null
-  test_ratio: 0.1
-  train_ratio: 0.8
-  val_ratio: 0.1
-  graph_data_path: ./Examples/pentadiamond/ # Directory where graph_data.npz is located
+  test_ratio: 0
+  train_ratio: 0.7
+  val_ratio: 0.3
+  graph_data_path:  /public/home/zhangchengyan/workspace/HamGNN/data_user/test/   # /public/home/wbchu/cwzhang/HamGNN/graph3/Sitrain # graph_data.npz所在的目录
 
 losses_metrics:
   losses:
-  - loss_weight: 1.0
+  - loss_weight: 1000
     metric: mae
     prediction: hamiltonian
     target: hamiltonian
-  #- loss_weight: 1.0
+  - loss_weight: 100
+    metric: mae
+    prediction: weighted_hamiltonian
+    target: weighted_hamiltonian
+  #- loss_weight: 0.001
   #  metric: mae
   #  prediction: band_gap
   #  target: band_gap
-  #- loss_weight: 0.001
-  #  metric: mae
-  #  prediction: band_energy
-  #  target: band_energy
+ # - loss_weight: 1
+ #   metric: mae
+ #   prediction: band_energy
+ #   target: band_energy
   #- loss_weight: 1.0
   #  metric: mae
   #  prediction: overlap
   #  target: overlap
-  #- loss_weight: 1.0
+  #- loss_weight: 1
   #  metric: mae
-  #  prediction: peak
+  #  prediction: peak # 1E-4 - 1E-8
   #  target: peak
+  #- loss_weight: 1000 # >1E-4
+  #  metric: mae
+  #  prediction: peak2
+  #  target: peak2
   #- loss_weight: 0.0
   #  metric: mae
   #  prediction: hamiltonian_imag
@@ -40,12 +51,18 @@ losses_metrics:
   - metric: mae
     prediction: hamiltonian
     target: hamiltonian
+  - metric: mae
+    prediction: weighted_hamiltonian
+    target: weighted_hamiltonian
   #- metric: mae
   #  prediction: band_gap
   #  target: band_gap
   #- metric: mae
   #  prediction: peak
   #  target: peak
+  #- metric: mae
+  #  prediction: peak2
+  #  target: peak2
   #- metric: mae
   #  prediction: overlap
   #  target: overlap
@@ -62,39 +79,44 @@ losses_metrics:
   #  prediction: wavefunction
   #  target: wavefunction
 
-# Generally, the optim_params module only needs to set the initial learning rate (lr)
+# 一般optim_params模块只需要设置初始学习率lr即可
 optim_params:
-  lr: 0.001
+  lr: 0.001 # 0.00001 #初始学习率 0.001 / 0.0001
   lr_decay: 0.5
-  lr_patience: 5
+  lr_patience: 10
   gradient_clip_val: 0.0
   max_epochs: 3000
-  min_epochs: 100
+  min_epochs: 30
   stop_patience: 30
 
 output_nets:
   output_module: HamGNN_out
   HamGNN_out:
-    ham_only: true # true: Only the Hamiltonian H is computed; 'false': Fit both H and S
-    ham_type: openmx # openmx: fit openmx Hamiltonian; abacus: fit abacus Hamiltonian
-    nao_max: 14 # The maximum number of atomic orbitals in the data set, which can be 14, 19 or 27
-    add_H0: true # Generally true, the complete Hamiltonian is predicted as the sum of H_scf plus H_nonscf (H0)
-    symmetrize: true # if set to true, the Hermitian symmetry constraint is imposed on the Hamiltonian
-    calculate_band_energy: false # Whether to calculate the energy bands to train the model
-    num_k: 5 # When calculating the energy bands, the number of K points to use
-    band_num_control: null # `dict`: controls how many orbitals are considered for each atom in energy bands; `int`: [vbm-num, vbm+num]; `null`: all bands
-    k_path: null # `auto`: Automatically determine the k-point path; `null`: random k-point path; `list`: list of k-point paths provided by the user
-    soc_switch: false # if true, fit the SOC Hamiltonian
+    create_graph: false # 预留参数，不用管，暂时无用
+    return_forces: false # 预留参数，不用管，暂时无用
+    include_triplet: false # 预留参数，不用管，暂时无用
+    ham_only: true # true: 只计算哈密顿量H； 'false': 拟合H和S
+    ham_type: siesta # openmx: 拟合openmx的哈密顿量
+    nao_max: 13 # 根据数据集中原子最大轨道数进行修改，可选14和19和27
+    add_H0: true # 一般时候为true，预测H_scf加上H_nonscf
+    symmetrize: true # 对哈密顿量施加厄密性约束，保证输出哈密顿量满足厄密性
+    weight_hamiltonian: true  # 是否对矩阵元通过距离指数进行加权, 暂时支持无SOC的
+    calculate_band_energy: false # 是否计算能带以对能带进行训练
+    num_k: 5 # 当计算能带时，所使用的k点数
+    band_num_control: 8 # dict:控制每种原子在能带计算时考虑多少个基底； int: [VBM-num, VBM+num]； null: all bands
+    k_path: null # [[0.5, 0, 0.5], [0.625, 0.25, 0.625], [0.375, 0.375, 0.75], [0.5, 0.5, 0.5], [0.5, 0.25, 0.75]] # 'auto': 自动确定k点路径. null: 随机k点. list: 用户自己确定的k点路径列表
+    soc_switch: false # true：拟合SOC哈密顿量
     nonlinearity_type: norm # norm or gate
+    export_reciprocal_values: false # 计算电声耦合矩阵epc时才有用，平时保持false
 
 profiler_params:
   progress_bar_refresh_rat: 1
-  train_dir: ./Examples/pentadiamond #The folder for saving training information and prediction results. This directory can be read by tensorboard to monitor the training process.
+  train_dir: /public/home/zhangchengyan/workspace/HamGNN/data_user/test/cost_weight_exp/training_data/  #/public/home/zhangchengyan/workspace/HamGNN/data_user/test/training_data/  #/public/home/wbchu/cwzhang/HamGNN/Si/fit3 #预测结果以及训练好的网络参数最后存放的目录
 
 representation_nets:
-  # Network parameters usually do not need to be changed.
+  # 网络参数通常无需改动
   HamGNN_pre:
-    cutoff: 20.0
+    cutoff: 24.0
     resnet: True
     cutoff_func: cos
     edge_sh_normalization: component
@@ -111,22 +133,38 @@ representation_nets:
     num_interaction_layers: 5
     num_radial: 8
     num_spherical: 8
-    num_types: 60
     export_triplet: false
     rbf_func: bessel
     set_features: true
-    add_edge_tp: false
+    add_edge_tp: false # true时内存开销更大，计算更准
     irreps_node_prev: 16x0o+16x0e+8x1o+8x1e+8x2e+8x2o+8x3o+8x3e+8x4o+8x4e
     num_node_attr_feas: 64
 
 setup:
-  GNN_Net: HamGNN_pre
+  GNN_Net: HamGNN_pre2 # HamGNN_pre, HamGNN_pre2
   accelerator: null
   ignore_warnings: true
-  checkpoint_path: ./network_weights_carbon.ckpt # Path to the model weights file
-  load_from_checkpoint: false
-  resume: false
-  num_gpus: null # null: use cpu; [i]: use the ith GPU device
+  checkpoint_path: /public/home/zhangchengyan/workspace/HamGNN/data_user/test/cost_weight_exp/training_data/version_0/checkpoints/epoch=30-val_loss=0.000000.ckpt   #/public/home/zhangchengyan/workspace/HamGNN/data_user/test/training_data/version_3/checkpoints/epoch=17-val_loss=0.000000.ckpt  #/public/home/zhangchengyan/workspace/HamGNN/data_user/test/training_data/   # /public/home/wbchu/cwzhang/HamGNN/Si/fit3/version_0/checkpoints/epoch=409-val_loss=0.000000.ckpt
+
+
+
+
+  l_minus_mean: false
+  load_from_checkpoint: false # true时加载模型参数，并按新的设置从新开始训练
+  resume: false # true时加载模型续算，并从上次中断的地方开始训练
+  num_gpus: 
+    - 0
+    - 1
+   # - 2
+   # - 3
   precision: 32
   property: hamiltonian
-  stage: test # fit: training; test: inference
+  stage: fit # fit：训练, test：测试/预测
+
+# 预测哈密顿量不需要设置post_processing参数
+# 不需要改动post_processing模块的参数
+post_processing:
+  post_utility: null
+  EPC:
+    band_win_min: 16
+    band_win_max: 17

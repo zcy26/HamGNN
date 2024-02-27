@@ -20,11 +20,12 @@ from typing import Union
 from ..layers import GaussianSmearing, cuttoff_envelope, CosineCutoff, BesselBasis, sph_harm_layer
 from .nequip.data import AtomicDataDict, AtomicDataset
 import math
-from .clebsch_gordan import ClebschGordan
-from e3nn.o3._wigner import _so3_clebsch_gordan
+from ..PhiSNet.modules.clebsch_gordan import ClebschGordan
 import copy
 from typing import Dict, Callable
 from .nequip.nn.nonlinearities import ShiftedSoftPlus
+from .nequip.utils.tp_utils import tp_path_exists
+from e3nn.util.jit import compile_mode
 from .kpoint_gen import kpoints_generator
 import numpy as np
 from pymatgen.core.periodic_table import Element
@@ -163,7 +164,6 @@ class residual_block(torch.nn.Module):
         if self.resnet:
             x = old_x + x
         return x
-
 class Edge_builder(GraphModuleMixin, torch.nn.Module):
 
     def __init__(
@@ -608,7 +608,7 @@ class HamGNN_pre(nn.Module):
         # Cosine basis function expansion layer
         self.cutoff = config.HamGNN_pre.cutoff
         self.cutoff_func = config.HamGNN_pre.cutoff_func
-        if 'p' == self.cutoff_func.lower()[0]:  # "envelope func used in Dimnet"
+        if 'e' == self.cutoff_func.lower()[0]:  # "envelope func used in Dimnet"
             self.cutoff_func = cuttoff_envelope(cutoff=self.cutoff, exponent=6)
         elif 'c' == self.cutoff_func.lower()[0]:  # "cosinecutoff" func
             self.cutoff_func = CosineCutoff(cutoff=self.cutoff)
@@ -673,7 +673,6 @@ class HamGNN_pre(nn.Module):
         self.spharm_edges(data)
         self.radial_basis(data)
         self.chemical_embedding(data)
-        # orbital convolution
         for i in range(self.num_interaction_layers):
             self.convnet[i](data)
         self.conv_to_output_node(data)    
@@ -788,7 +787,6 @@ class HamGNN_pre2(nn.Module):
         self.spharm_edges(data)
         self.radial_basis(data)
         self.chemical_embedding(data)
-        # orbital convolution
         for i in range(self.num_interaction_layers):
             self.convnet[i](data)
         self.conv_to_output_node(data)    
@@ -808,7 +806,7 @@ class HamGNN_out(nn.Module):
     
     def __init__(self, irreps_in_node: Union[int, str, o3.Irreps]=None, irreps_in_edge: Union[int, str, o3.Irreps]=None, irreps_in_triplet: Union[int, str, o3.Irreps]=None, nao_max: int = 14, return_forces=False, create_graph=False, 
                  ham_type: str='openmx', ham_only: bool = False, symmetrize: bool=True, include_triplet: bool = False, calculate_band_energy: bool = False, num_k: int = 8, 
-                 k_path:Union[list, np.array, tuple]=None, band_num_control:dict=None, soc_switch:bool=True, nonlinearity_type:str='norm', export_reciprocal_values: bool = False, add_H0:bool= False):
+                 k_path:Union[list, np.array, tuple]=None, band_num_control:dict=None, soc_switch:bool=True, nonlinearity_type:str='norm', export_reciprocal_values: bool = False, add_H0:bool= False, weight_hamiltonian: bool=False):
 
         
         """
@@ -831,6 +829,7 @@ class HamGNN_out(nn.Module):
         self.nonlinearity_type = nonlinearity_type
         self.export_reciprocal_values = export_reciprocal_values
         self.add_H0 = add_H0
+        self.weight_hamiltonian = weight_hamiltonian
         # band
         self.calculate_band_energy = calculate_band_energy
         self.num_k = num_k
@@ -846,24 +845,7 @@ class HamGNN_out(nn.Module):
         
         # openmx
         if self.ham_type == 'openmx':
-            self.num_valence = {Element['H'].Z: 1, Element['He'].Z: 2, Element['Li'].Z: 3, Element['Be'].Z: 2, Element['B'].Z: 3,
-                                Element['C'].Z: 4, Element['N'].Z: 5,  Element['O'].Z: 6,  Element['F'].Z: 7,  Element['Ne'].Z: 8,
-                                Element['Na'].Z: 9, Element['Mg'].Z: 8, Element['Al'].Z: 3, Element['Si'].Z: 4, Element['P'].Z: 5,
-                                Element['S'].Z: 6,  Element['Cl'].Z: 7, Element['Ar'].Z: 8, Element['K'].Z: 9,  Element['Ca'].Z: 10,
-                                Element['Sc'].Z: 11, Element['Ti'].Z: 12, Element['V'].Z: 13, Element['Cr'].Z: 14, Element['Mn'].Z: 15,
-                                Element['Fe'].Z: 16, Element['Co'].Z: 17, Element['Ni'].Z: 18, Element['Cu'].Z: 19, Element['Zn'].Z: 20,
-                                Element['Ga'].Z: 13, Element['Ge'].Z: 4,  Element['As'].Z: 15, Element['Se'].Z: 6,  Element['Br'].Z: 7,
-                                Element['Kr'].Z: 8,  Element['Rb'].Z: 9,  Element['Sr'].Z: 10, Element['Y'].Z: 11, Element['Zr'].Z: 12,
-                                Element['Nb'].Z: 13, Element['Mo'].Z: 14, Element['Tc'].Z: 15, Element['Ru'].Z: 14, Element['Rh'].Z: 15,
-                                Element['Pd'].Z: 16, Element['Ag'].Z: 17, Element['Cd'].Z: 12, Element['In'].Z: 13, Element['Sn'].Z: 14,
-                                Element['Sb'].Z: 15, Element['Te'].Z: 16, Element['I'].Z: 7, Element['Xe'].Z: 8, Element['Cs'].Z: 9,
-                                Element['Ba'].Z: 10, Element['La'].Z: 11, Element['Ce'].Z: 12, Element['Pr'].Z: 13, Element['Nd'].Z: 14,
-                                Element['Pm'].Z: 15, Element['Sm'].Z: 16, Element['Dy'].Z: 20, Element['Ho'].Z: 21, Element['Lu'].Z: 11,
-                                Element['Hf'].Z: 12, Element['Ta'].Z: 13, Element['W'].Z: 12,  Element['Re'].Z: 15, Element['Os'].Z: 14,
-                                Element['Ir'].Z: 15, Element['Pt'].Z: 16, Element['Au'].Z: 17, Element['Hg'].Z: 18, Element['Tl'].Z: 19,
-                                Element['Pb'].Z: 14, Element['Bi'].Z: 15
-                            }
-            
+            self.num_valence = {1:1,2:2,3:3,4:2,5:3,6:4,7:5,8:6,9:7,10:8,11:9,12:8,13:3,14:4,15:5,16:6,17:7,18:8,19:9,20:10,35:7}
             if self.nao_max == 14:
                 self.index_change = torch.LongTensor([0,1,2,5,3,4,8,6,7,11,13,9,12,10])       
                 self.row = self.col = o3.Irreps("1x0e+1x0e+1x0e+1x1o+1x1o+1x2e")
@@ -887,10 +869,8 @@ class HamGNN_out(nn.Module):
                                     18:[0,1,3,4,5,6,7,8,9,10,11,12,13], # Ar
                                     19:[0,1,2,3,4,5,6,7,8,9,10,11,12,13], # K
                                     20:[0,1,2,3,4,5,6,7,8,9,10,11,12,13], # Ca
-                                    35:[0,1,2,3,4,5,6,7,8,9,10,11,12,13], # Br  
-                                    Element['V'].Z: [0,1,2,3,4,5,6,7,8,9,10,11,12,13], # V
+                                    35:[0,1,2,3,4,5,6,7,8,9,10,11,12,13] # Br         
                                 }
-            
             elif self.nao_max == 13:
                 self.basis_def = {  1:[0,1,2,3,4], # H
                                     5:[0,1,2,3,4,5,6,7,8,9,10,11,12], # B
@@ -900,7 +880,6 @@ class HamGNN_out(nn.Module):
                                 }
                 self.index_change = torch.LongTensor([0,1,4,2,3,7,5,6,10,12,8,11,9])       
                 self.row = self.col = o3.Irreps("1x0e+1x0e+1x1o+1x1o+1x2e")
-            
             elif self.nao_max == 19:
                 self.index_change = torch.LongTensor([0,1,2,5,3,4,8,6,7,11,13,9,12,10,16,18,14,17,15])       
                 self.row = self.col = o3.Irreps("1x0e+1x0e+1x0e+1x1o+1x1o+1x2e+1x2e")
@@ -932,97 +911,10 @@ class HamGNN_out(nn.Module):
                                     82:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], # pb
                                     55:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], # Cs
                                     33:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], # As
-                                    31:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], # Ga  
-                                    32:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], # Ge
-                                    Element['V'].Z: [0,1,2,3,4,5,6,7,8,9,10,11,12,13], # V
-                                    Element['Sb'].Z: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], # Sb
+                                    31:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18] # Ga  
                                 }
-            
-            elif self.nao_max == 26:
-                self.index_change = torch.LongTensor([0,1,2,5,3,4,8,6,7,11,13,9,12,10,16,18,14,17,15,22,23,21,24,20,25,19])       
-                self.row = self.col = o3.Irreps("1x0e+1x0e+1x0e+1x1o+1x1o+1x2e+1x2e+1x3o")
-                self.basis_def = (lambda s1=[0],s2=[1],s3=[2],p1=[3,4,5],p2=[6,7,8],d1=[9,10,11,12,13],d2=[14,15,16,17,18],f1=[19,20,21,22,23,24,25]: {
-                    Element['H'].Z : s1+s2+p1,  # H6.0-s2p1
-                    Element['He'].Z : s1+s2+p1,  # He8.0-s2p1
-                    Element['Li'].Z : s1+s2+s3+p1+p2,  # Li8.0-s3p2
-                    Element['Be'].Z : s1+s2+p1+p2,  # Be7.0-s2p2
-                    Element['B'].Z : s1+s2+p1+p2+d1,  # B7.0-s2p2d1
-                    Element['C'].Z : s1+s2+p1+p2+d1,  # C6.0-s2p2d1
-                    Element['N'].Z : s1+s2+p1+p2+d1,  # N6.0-s2p2d1
-                    Element['O'].Z : s1+s2+p1+p2+d1,  # O6.0-s2p2d1
-                    Element['F'].Z : s1+s2+p1+p2+d1,  # F6.0-s2p2d1
-                    Element['Ne'].Z: s1+s2+p1+p2+d1,  # Ne9.0-s2p2d1
-                    Element['Na'].Z: s1+s2+s3+p1+p2+d1,  # Na9.0-s3p2d1
-                    Element['Mg'].Z: s1+s2+s3+p1+p2+d1,  # Mg9.0-s3p2d1
-                    Element['Al'].Z: s1+s2+p1+p2+d1,  # Al7.0-s2p2d1
-                    Element['Si'].Z: s1+s2+p1+p2+d1,  # Si7.0-s2p2d1
-                    Element['P'].Z: s1+s2+p1+p2+d1,  # P7.0-s2p2d1
-                    Element['S'].Z: s1+s2+p1+p2+d1,  # S7.0-s2p2d1
-                    Element['Cl'].Z: s1+s2+p1+p2+d1,  # Cl7.0-s2p2d1
-                    Element['Ar'].Z: s1+s2+p1+p2+d1,  # Ar9.0-s2p2d1
-                    Element['K'].Z: s1+s2+s3+p1+p2+d1,  # K10.0-s3p2d1
-                    Element['Ca'].Z: s1+s2+s3+p1+p2+d1,  # Ca9.0-s3p2d1
-                    Element['Sc'].Z: s1+s2+s3+p1+p2+d1,  # Sc9.0-s3p2d1
-                    Element['Ti'].Z: s1+s2+s3+p1+p2+d1,  # Ti7.0-s3p2d1
-                    Element['V'].Z: s1+s2+s3+p1+p2+d1,  # V6.0-s3p2d1
-                    Element['Cr'].Z: s1+s2+s3+p1+p2+d1,  # Cr6.0-s3p2d1
-                    Element['Mn'].Z: s1+s2+s3+p1+p2+d1,  # Mn6.0-s3p2d1
-                    Element['Fe'].Z: s1+s2+s3+p1+p2+d1,  # Fe5.5H-s3p2d1
-                    Element['Co'].Z: s1+s2+s3+p1+p2+d1,  # Co6.0H-s3p2d1
-                    Element['Ni'].Z: s1+s2+s3+p1+p2+d1,  # Ni6.0H-s3p2d1
-                    Element['Cu'].Z: s1+s2+s3+p1+p2+d1,  # Cu6.0H-s3p2d1
-                    Element['Zn'].Z: s1+s2+s3+p1+p2+d1,  # Zn6.0H-s3p2d1
-                    Element['Ga'].Z: s1+s2+s3+p1+p2+d1+d2,  # Ga7.0-s3p2d2
-                    Element['Ge'].Z: s1+s2+s3+p1+p2+d1+d2,  # Ge7.0-s3p2d2
-                    Element['As'].Z: s1+s2+s3+p1+p2+d1+d2,  # As7.0-s3p2d2
-                    Element['Se'].Z: s1+s2+s3+p1+p2+d1+d2,  # Se7.0-s3p2d2
-                    Element['Br'].Z: s1+s2+s3+p1+p2+d1+d2,  # Br7.0-s3p2d2
-                    Element['Kr'].Z: s1+s2+s3+p1+p2+d1+d2,  # Kr10.0-s3p2d2
-                    Element['Rb'].Z: s1+s2+s3+p1+p2+d1+d2,  # Rb11.0-s3p2d2
-                    Element['Sr'].Z: s1+s2+s3+p1+p2+d1+d2,  # Sr10.0-s3p2d2
-                    Element['Y'].Z: s1+s2+s3+p1+p2+d1+d2,  # Y10.0-s3p2d2
-                    Element['Zr'].Z: s1+s2+s3+p1+p2+d1+d2,  # Zr7.0-s3p2d2
-                    Element['Nb'].Z: s1+s2+s3+p1+p2+d1+d2,  # Nb7.0-s3p2d2
-                    Element['Mo'].Z: s1+s2+s3+p1+p2+d1+d2,  # Mo7.0-s3p2d2
-                    Element['Tc'].Z: s1+s2+s3+p1+p2+d1+d2,  # Tc7.0-s3p2d2
-                    Element['Ru'].Z: s1+s2+s3+p1+p2+d1+d2,  # Ru7.0-s3p2d2
-                    Element['Rh'].Z: s1+s2+s3+p1+p2+d1+d2,  # Rh7.0-s3p2d2
-                    Element['Pd'].Z: s1+s2+s3+p1+p2+d1+d2,  # Pd7.0-s3p2d2
-                    Element['Ag'].Z: s1+s2+s3+p1+p2+d1+d2,  # Ag7.0-s3p2d2
-                    Element['Cd'].Z: s1+s2+s3+p1+p2+d1+d2,  # Cd7.0-s3p2d2
-                    Element['In'].Z: s1+s2+s3+p1+p2+d1+d2,  # In7.0-s3p2d2
-                    Element['Sn'].Z: s1+s2+s3+p1+p2+d1+d2,  # Sn7.0-s3p2d2
-                    Element['Sb'].Z: s1+s2+s3+p1+p2+d1+d2,  # Sb7.0-s3p2d2
-                    Element['Te'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Te7.0-s3p2d2f1
-                    Element['I'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # I7.0-s3p2d2f1
-                    Element['Xe'].Z: s1+s2+s3+p1+p2+d1+d2,  # Xe11.0-s3p2d2
-                    Element['Cs'].Z: s1+s2+s3+p1+p2+d1+d2,  # Cs12.0-s3p2d2
-                    Element['Ba'].Z: s1+s2+s3+p1+p2+d1+d2,  # Ba10.0-s3p2d2
-                    Element['La'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # La8.0-s3p2d2f1
-                    Element['Ce'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Ce8.0-s3p2d2f1
-                    Element['Pr'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Pr8.0-s3p2d2f1
-                    Element['Nd'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Nd8.0-s3p2d2f1
-                    Element['Pm'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Pm8.0-s3p2d2f1
-                    Element['Sm'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Sm8.0-s3p2d2f1
-                    Element['Dy'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Dy8.0-s3p2d2f1
-                    Element['Ho'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Ho8.0-s3p2d2f1
-                    Element['Lu'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Lu8.0-s3p2d2f1
-                    Element['Hf'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Hf9.0-s3p2d2f1
-                    Element['Ta'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Ta7.0-s3p2d2f1
-                    Element['W'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # W7.0-s3p2d2f1
-                    Element['Re'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Re7.0-s3p2d2f1
-                    Element['Os'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Os7.0-s3p2d2f1
-                    Element['Ir'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Ir7.0-s3p2d2f1
-                    Element['Pt'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Pt7.0-s3p2d2f1
-                    Element['Au'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Au7.0-s3p2d2f1
-                    Element['Hg'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Hg8.0-s3p2d2f1
-                    Element['Tl'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Tl8.0-s3p2d2f1
-                    Element['Pb'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Pb8.0-s3p2d2f1
-                    Element['Bi'].Z: s1+s2+s3+p1+p2+d1+d2+f1,  # Bi8.0-s3p2d2f1 
-                })()
             else:
                 raise NotImplementedError
-        
         elif self.ham_type == 'siesta':
             self.num_valence = {
                 1:1,2:2,
@@ -1086,74 +978,93 @@ class HamGNN_out(nn.Module):
             else:
                 raise NotImplementedError
         elif self.ham_type == 'abacus':
-            if self.nao_max == 27:
+            if self.nao_max == 13:
+                self.index_change = torch.LongTensor([0,1,3,4,2,6,7,5,10,11,9,12,8])
+                self.row = self.col = o3.Irreps("1x0e+1x0e+1x1o+1x1o+1x2e")
+                self.minus_index = torch.LongTensor([3,4,6,7,9,10])
+                self.basis_def = (lambda s1=[0],s2=[1],p1=[2,3,4],p2=[5,6,7],d1=[8,9,10,11,12]: {
+                    1 : np.array(s1+s2+p1, dtype=int), # H
+                    2 : np.array(s1+s2+p1, dtype=int), # He
+                    5 : np.array(s1+s2+p1+p2+d1, dtype=int), # B
+                    6 : np.array(s1+s2+p1+p2+d1, dtype=int), # C
+                    7 : np.array(s1+s2+p1+p2+d1, dtype=int), # N
+                    8 : np.array(s1+s2+p1+p2+d1, dtype=int), # O
+                    9 : np.array(s1+s2+p1+p2+d1, dtype=int), # F
+                    10: np.array(s1+s2+p1+p2+d1, dtype=int), # Ne
+                    14: np.array(s1+s2+p1+p2+d1, dtype=int), # Si
+                    15: np.array(s1+s2+p1+p2+d1, dtype=int), # P
+                    16: np.array(s1+s2+p1+p2+d1, dtype=int), # S
+                    17: np.array(s1+s2+p1+p2+d1, dtype=int), # Cl
+                    18: np.array(s1+s2+p1+p2+d1, dtype=int), # Ar
+                })()
+            elif self.nao_max == 27:
                 self.index_change = torch.LongTensor([0,1,2,3,5,6,4,8,9,7,12,13,11,14,10,17,18,16,19,15,23,24,22,25,21,26,20])       
                 self.row = self.col = o3.Irreps("1x0e+1x0e+1x0e+1x0e+1x1o+1x1o+1x2e+1x2e+1x3o")
                 self.minus_index = torch.LongTensor([5,6,8,9,11,12,16,17,21,22,25,26]) # this list should follow the order in abacus.
                 self.basis_def = (lambda s1=[0],s2=[1],s3=[2],s4=[3],p1=[4,5,6],p2=[7,8,9],d1=[10,11,12,13,14],d2=[15,16,17,18,19],f1=[20,21,22,23,24,25,26]: {
-                1 : s1+s2+p1, # H
-                2 : s1+s2+p1, # He
-                3 : s1+s2+s3+s4+p1, # Li
-                4 : s1+s2+s3+s4+p1, # Bi
-                5 : s1+s2+p1+p2+d1, # B
-                6 : s1+s2+p1+p2+d1, # C
-                7 : s1+s2+p1+p2+d1, # N
-                8 : s1+s2+p1+p2+d1, # O
-                9 : s1+s2+p1+p2+d1, # F
-                10: s1+s2+p1+p2+d1, # Ne
-                11: s1+s2+s3+s4+p1+p2+d1, # Na
-                12: s1+s2+s3+s4+p1+p2+d1, # Mg
-                # 13: Al
-                14: s1+s2+p1+p2+d1, # Si
-                15: s1+s2+p1+p2+d1, # P
-                16: s1+s2+p1+p2+d1, # S
-                17: s1+s2+p1+p2+d1, # Cl
-                18: s1+s2+p1+p2+d1, # Ar
-                19: s1+s2+s3+s4+p1+p2+d1, # K
-                20: s1+s2+s3+s4+p1+p2+d1, # Ca
-                21: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Sc
-                22: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ti
-                23: s1+s2+s3+s4+p1+p2+d1+d2+f1, # V
-                24: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Cr
-                25: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Mn
-                26: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Fe
-                27: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Co
-                28: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ni
-                29: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Cu
-                30: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Zn
-                31: s1+s2+p1+p2+d1+d2+f1, # Ga
-                32: s1+s2+p1+p2+d1+d2+f1, # Ge
-                33: s1+s2+p1+p2+d1, # As
-                34: s1+s2+p1+p2+d1, # Se
-                35: s1+s2+p1+p2+d1, # Br
-                36: s1+s2+p1+p2+d1, # Kr
-                37: s1+s2+s3+s4+p1+p2+d1, # Rb
-                38: s1+s2+s3+s4+p1+p2+d1, # Sr
-                39: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Y
-                40: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Zr
-                41: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Nb
-                42: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Mo
-                43: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Tc
-                44: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ru
-                45: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Rh
-                46: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Pd
-                47: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ag
-                48: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Cd
-                49: s1+s2+p1+p2+d1+d2+f1, # In
-                50: s1+s2+p1+p2+d1+d2+f1, # Sn
-                51: s1+s2+p1+p2+d1+d2+f1, # Sb
-                52: s1+s2+p1+p2+d1+d2+f1, # Te
-                53: s1+s2+p1+p2+d1+d2+f1, # I
-                54: s1+s2+p1+p2+d1+d2+f1, # Xe
-                55: s1+s2+s3+s4+p1+p2+d1, # Cs
-                56: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ba
-                #
-                79: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Au
-                80: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Hg
-                81: s1+s2+p1+p2+d1+d2+f1, # Tl
-                82: s1+s2+p1+p2+d1+d2+f1, # Pb
-                83: s1+s2+p1+p2+d1+d2+f1, # Bi
-            })()
+                    1 : s1+s2+p1, # H
+                    2 : s1+s2+p1, # He
+                    3 : s1+s2+s3+s4+p1, # Li
+                    4 : s1+s2+s3+s4+p1, # Bi
+                    5 : s1+s2+p1+p2+d1, # B
+                    6 : s1+s2+p1+p2+d1, # C
+                    7 : s1+s2+p1+p2+d1, # N
+                    8 : s1+s2+p1+p2+d1, # O
+                    9 : s1+s2+p1+p2+d1, # F
+                    10: s1+s2+p1+p2+d1, # Ne
+                    11: s1+s2+s3+s4+p1+p2+d1, # Na
+                    12: s1+s2+s3+s4+p1+p2+d1, # Mg
+                    # 13: Al
+                    14: s1+s2+p1+p2+d1, # Si
+                    15: s1+s2+p1+p2+d1, # P
+                    16: s1+s2+p1+p2+d1, # S
+                    17: s1+s2+p1+p2+d1, # Cl
+                    18: s1+s2+p1+p2+d1, # Ar
+                    19: s1+s2+s3+s4+p1+p2+d1, # K
+                    20: s1+s2+s3+s4+p1+p2+d1, # Ca
+                    21: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Sc
+                    22: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ti
+                    23: s1+s2+s3+s4+p1+p2+d1+d2+f1, # V
+                    24: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Cr
+                    25: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Mn
+                    26: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Fe
+                    27: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Co
+                    28: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ni
+                    29: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Cu
+                    30: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Zn
+                    31: s1+s2+p1+p2+d1+d2+f1, # Ga
+                    32: s1+s2+p1+p2+d1+d2+f1, # Ge
+                    33: s1+s2+p1+p2+d1, # As
+                    34: s1+s2+p1+p2+d1, # Se
+                    35: s1+s2+p1+p2+d1, # Br
+                    36: s1+s2+p1+p2+d1, # Kr
+                    37: s1+s2+s3+s4+p1+p2+d1, # Rb
+                    38: s1+s2+s3+s4+p1+p2+d1, # Sr
+                    39: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Y
+                    40: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Zr
+                    41: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Nb
+                    42: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Mo
+                    43: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Tc
+                    44: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ru
+                    45: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Rh
+                    46: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Pd
+                    47: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ag
+                    48: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Cd
+                    49: s1+s2+p1+p2+d1+d2+f1, # In
+                    50: s1+s2+p1+p2+d1+d2+f1, # Sn
+                    51: s1+s2+p1+p2+d1+d2+f1, # Sb
+                    52: s1+s2+p1+p2+d1+d2+f1, # Te
+                    53: s1+s2+p1+p2+d1+d2+f1, # I
+                    54: s1+s2+p1+p2+d1+d2+f1, # Xe
+                    55: s1+s2+s3+s4+p1+p2+d1, # Cs
+                    56: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Ba
+                    #
+                    79: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Au
+                    80: s1+s2+s3+s4+p1+p2+d1+d2+f1, # Hg
+                    81: s1+s2+p1+p2+d1+d2+f1, # Tl
+                    82: s1+s2+p1+p2+d1+d2+f1, # Pb
+                    83: s1+s2+p1+p2+d1+d2+f1, # Bi
+                })()
 
                 # this dict is for abacus calculation.
                 self.num_valence = {1: 1,  2: 2,
@@ -1191,6 +1102,12 @@ class HamGNN_out(nn.Module):
                                 79: 19, 80: 20,
                                 81: 13, 82: 14,
                                 83: 15}
+        # ORCA
+        elif self.ham_type == 'orca':
+            self.index_change = None     
+            self.row = self.col = o3.Irreps("1x0e+1x0e+1x0e+1x1o+1x1o+1x2e")
+            self.basis_def = {1:[1,2,4,5,6],6:[1,2,3,4,5,6,7,8,9,10,11,12,13,14],
+                              7:[1,2,3,4,5,6,7,8,9,10,11,12,13,14], 8:[1,2,3,4,5,6,7,8,9,10,11,12,13,14]}
         # pasp
         elif self.ham_type == 'pasp':   
             self.row = self.col = o3.Irreps("1x1o")
@@ -1868,6 +1785,12 @@ class HamGNN_out(nn.Module):
         return torch.cat(band_energy, dim=0), torch.cat(wavefunction, dim=0).reshape(-1)
     
     def mask_Ham(self, Hon, Hoff, data):
+        # # a brutal way to debug # band energy will not work! # set elements corresponding to not used orbits to 0
+        # Hon_mask = torch.zeros_like(Hon)
+        # Hon_mask[data.orbmask_on>0] = Hon[data.orbmask_on>0]
+        # Hoff_mask = torch.zeros_like(Hoff)
+        # Hoff_mask[data.orbmask_off>0] = Hoff[data.orbmask_off>0]
+        # return Hon_mask, Hoff_mask
         # parse the Atomic Orbital Basis Sets
         basis_definition = torch.zeros((99, self.nao_max)).type_as(data.z)
         # key is the atomic number, value is the index of the occupied orbits.
@@ -1900,17 +1823,7 @@ class HamGNN_out(nn.Module):
         return Hsoc
     
     def reduce(self, coefficient):
-        if self.nao_max == 14:
-            coefficient = coefficient.reshape(coefficient.shape[0], self.nao_max, self.nao_max)
-            coefficient[:, 3:6] = torch.mean(coefficient[:, 3:6], dim=1, keepdim=True).expand(coefficient.shape[0], 3, self.nao_max)
-            coefficient[:, 6:9] = torch.mean(coefficient[:, 6:9], dim=1, keepdim=True).expand(coefficient.shape[0], 3, self.nao_max)
-            coefficient[:, 9:14] = torch.mean(coefficient[:, 9:14], dim=1, keepdim=True).expand(coefficient.shape[0], 5, self.nao_max)
-            #
-            coefficient[:, :, 3:6] = torch.mean(coefficient[:, :, 3:6], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 3)
-            coefficient[:, :, 6:9] = torch.mean(coefficient[:, :, 6:9], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 3)
-            coefficient[:, :, 9:14] = torch.mean(coefficient[:, :, 9:14], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 5)
-            
-        elif self.nao_max == 19:
+        if self.nao_max == 19:
             coefficient = coefficient.reshape(coefficient.shape[0], self.nao_max, self.nao_max)
             coefficient[:, 3:6] = torch.mean(coefficient[:, 3:6], dim=1, keepdim=True).expand(coefficient.shape[0], 3, self.nao_max)
             coefficient[:, 6:9] = torch.mean(coefficient[:, 6:9], dim=1, keepdim=True).expand(coefficient.shape[0], 3, self.nao_max)
@@ -1921,29 +1834,9 @@ class HamGNN_out(nn.Module):
             coefficient[:, :, 6:9] = torch.mean(coefficient[:, :, 6:9], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 3)
             coefficient[:, :, 9:14] = torch.mean(coefficient[:, :, 9:14], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 5)
             coefficient[:, :, 14:19] = torch.mean(coefficient[:, :, 14:19], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 5)
-
-        elif self.nao_max == 26:
-            coefficient = coefficient.reshape(coefficient.shape[0], self.nao_max, self.nao_max)
-            coefficient[:, 3:6] = torch.mean(coefficient[:, 3:6], dim=1, keepdim=True).expand(coefficient.shape[0], 3, self.nao_max)
-            coefficient[:, 6:9] = torch.mean(coefficient[:, 6:9], dim=1, keepdim=True).expand(coefficient.shape[0], 3, self.nao_max)
-            coefficient[:, 9:14] = torch.mean(coefficient[:, 9:14], dim=1, keepdim=True).expand(coefficient.shape[0], 5, self.nao_max)
-            coefficient[:, 14:19] = torch.mean(coefficient[:, 14:19], dim=1, keepdim=True).expand(coefficient.shape[0], 5, self.nao_max)
-            coefficient[:, 19:26] = torch.mean(coefficient[:, 19:26], dim=1, keepdim=True).expand(coefficient.shape[0], 7, self.nao_max)
-            #
-            coefficient[:, :, 3:6] = torch.mean(coefficient[:, :, 3:6], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 3)
-            coefficient[:, :, 6:9] = torch.mean(coefficient[:, :, 6:9], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 3)
-            coefficient[:, :, 9:14] = torch.mean(coefficient[:, :, 9:14], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 5)
-            coefficient[:, :, 14:19] = torch.mean(coefficient[:, :, 14:19], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 5)
-            coefficient[:, :, 19:26] = torch.mean(coefficient[:, :, 19:26], dim=2, keepdim=True).expand(coefficient.shape[0], self.nao_max, 7)
         return coefficient.view(coefficient.shape[0], -1)
          
     def forward(self, data, graph_representation: dict = None):
-        # prepare data.hamiltonian & data.overlap
-        if 'hamiltonian' not in data:
-            data.hamiltonian = torch.cat([data.Hon, data.Hoff], dim=0)
-        if 'overlap' not in data:
-            data.overlap = torch.cat([data.Son, data.Soff], dim=0)
-        
         node_attr = graph_representation['node_attr']
         edge_attr = graph_representation['edge_attr']  # mji
         j, i = data.edge_index
@@ -1967,7 +1860,7 @@ class HamGNN_out(nn.Module):
         
             # Impose Hermitian symmetry for Son
             Son = self.symmetrize_Hon(Son)
-
+               
             # Calculate the off-site overlap
             # Calculate the contribution of the edges       
             edge_sph = self.offsitenet_s(edge_attr)
@@ -2082,7 +1975,7 @@ class HamGNN_out(nn.Module):
             else:
                 band_energy = None
                 wavefunction = None
-        else:                
+        else:  # no SOC
             node_sph = self.onsitenet_residual(node_attr)
             node_sph = self.onsitenet_linear(node_sph) 
             node_sph = torch.split(node_sph, self.ham_irreps_dim.tolist(), dim=-1)
@@ -2175,9 +2068,26 @@ class HamGNN_out(nn.Module):
                           'wavefunction': wavefunction, 'iHon': Hsoc_on_imag, 'iHoff': Hsoc_off_imag}
             else:
                 H = self.cat_onsite_and_offsite(data, Hon, Hoff)
-                result = {'hamiltonian': H, 'band_energy': band_energy, 'wavefunction': wavefunction, 'band_gap':gap, 'H_sym': H_sym}
+                # peak
+                res = torch.where((data.hamiltonian.abs() > 1E-3))
+                peak = H[res]
+                data.peak = data.hamiltonian[res]
+                # res = torch.where((data.hamiltonian.abs() <= 1E-1) & (data.hamiltonian.abs() > 1E-8))
+                # peak = H[res]
+                # data.peak = data.hamiltonian[res]
+                # res2 = torch.where(data.hamiltonian.abs() > 1E-4)
+                # peak2 = H[res2]
+                # data.peak2 = data.hamiltonian[res2]
+                result = {'hamiltonian': H, 'band_energy': band_energy, 'wavefunction': wavefunction, 'band_gap':gap, 'H_sym': H_sym, 'peak': peak}
+                if self.weight_hamiltonian:  # weight the Hoff
+                    weighted_hamiltonian = self.cat_onsite_and_offsite(data, Hon, Hoff*data["weights"])
+                    result.update({"weighted_hamiltonian": weighted_hamiltonian})
                 if self.export_reciprocal_values:
                     result.update({'HK':HK, 'SK':SK, 'dSK': dSK})
+        # ORCA
+        elif self.ham_type == 'orca':
+            H = self.convert_to_mole_Ham(data, Hon, Hoff)
+            result = {'hamiltonian': H}
         else:
             raise NotImplementedError
         
@@ -2185,6 +2095,9 @@ class HamGNN_out(nn.Module):
             # openmx
             if self.ham_type in ['openmx','pasp', 'siesta','abacus']:
                 S = self.cat_onsite_and_offsite(data, Son, Soff)
+            # ORCA
+            elif self.ham_type == 'orca':
+                S = self.convert_to_mole_Ham(data, Son, Soff)
             else:
                 raise NotImplementedError
             result.update({'overlap': S})
