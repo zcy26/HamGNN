@@ -31,54 +31,6 @@ from models.utils import get_hparam_dict
 from scipy.optimize import curve_fit
 
 
-
-#def calculate_weight(data_set, a="fit"):
-#    '''Calculate the weight applied to each matrix element.
-#    A weight proportional to exp(-a*rij) is added to each off-site matrices.
-#    The weights are normalized so that the maximum weight equals 1.'''
-#    # Extract rij and off-site H data
-#    dist_all = []
-#    n_edge_all = []  # n_edge_all[i] is the n_edge of struct i
-#    Hoff_mean_all = []
-#    for sample in data_set:
-#        Hoff = torch.abs(sample["Hoff"]).numpy()
-#        Hoff = np.ma.masked_equal(Hoff, 0.0)  # omit the unused orbitals
-#        Hoff_mean = torch.FloatTensor(np.mean(Hoff, axis=1))
-#        # Hoff_mean = torch.mean(torch.abs(sample["Hoff"]), dim=1)  # mean abs value of off site sub matrix
-#        Hoff_mean_all.append(Hoff_mean)
-#        src_node_pos = sample["pos"][sample["edge_index"][0]]
-#        tgt_node_pos = sample["pos"][sample["edge_index"][1]]  # (n_edge, 3)
-#        tgt_node_pos += sample["nbr_shift"]  # (n_edge, 3)
-#        rel_pos = tgt_node_pos - src_node_pos  # relative offsite vector
-#        dist = torch.linalg.norm(rel_pos, dim=1)  # distance between 2 atoms
-#        dist_all.append(dist)
-#        n_edge_all.append(sample["edge_index"].shape[1])
-#
-#    Hoff_mean_all = torch.cat(Hoff_mean_all)
-#    dist_all = torch.cat(dist_all)
-#
-#    if a == "fit":  # fit a
-#        def exp_fit(x, A, a):
-#            return A * np.exp(-a * x)
-#
-#        popt, pcov = curve_fit(exp_fit, dist_all.numpy(), Hoff_mean_all.numpy())
-#        rmse = np.sqrt(torch.sum(torch.abs(Hoff_mean_all - exp_fit(dist_all, *popt))**2) / len(dist_all))
-#        a = popt[1]  # coeff in the weight
-#        print(f"The Target Hamiltonian is fitted to give the off-site weights, with a={a}, and rmse={rmse}")
-#
-#    # weight the Hamiltonian
-#    weights = torch.exp(-a * dist_all)
-#    weights = weights / torch.max(weights)  # normalization
-#    # assert torch.all(weights > 0)
-#    idx = 0
-#    for i in range(len(data_set)):
-#        weight_i = weights[idx: idx+n_edge_all[i]]
-#        # assert len(weight_i) == data_set[i].edge_index.shape[1]
-#        data_set[i].weights = weight_i.reshape(-1, 1).contiguous()
-#        weighted_Hoff = data_set[i].weights * data_set[i].Hoff
-#        data_set[i].weighted_hamiltonian = torch.cat([data_set[i].Hon, weighted_Hoff]).contiguous()
-
-
 def prepare_data(config):
     train_ratio = config.dataset_params.train_ratio
     val_ratio = config.dataset_params.val_ratio
@@ -295,36 +247,67 @@ def train_and_eval(config):
             lr_decay=config.optim_params.lr_decay,
             lr_patience=config.optim_params.lr_patience,
             )
-        callbacks = [
-            pl.callbacks.LearningRateMonitor(),
-            pl.callbacks.EarlyStopping(
-                monitor="training/total_loss",
-                patience=config.optim_params.stop_patience, min_delta=1e-6,
-            ),
-            pl.callbacks.ModelCheckpoint(
+        if config.setup.deterministic:
+            ckpt = pl.callbacks.ModelCheckpoint(
+                filename="{epoch}",
+                save_top_k=1,
+                verbose=False,
+                every_n_epochs=5  # save every 5 epochs
+            )
+        else:
+            ckpt = pl.callbacks.ModelCheckpoint(
                 filename="{epoch}-{val_loss:.6f}",
                 save_top_k=1,
                 verbose=False,
                 monitor='validation/total_loss',
                 mode='min',
             )
+        callbacks = [
+            pl.callbacks.LearningRateMonitor(),
+            pl.callbacks.EarlyStopping(
+                monitor="training/total_loss",
+                patience=config.optim_params.stop_patience, min_delta=1e-6,
+            ),
+           # pl.callbacks.ModelCheckpoint(
+           #     filename="{epoch}-{val_loss:.6f}",
+           #     save_top_k=1,
+           #     verbose=False,
+           #     monitor='validation/total_loss',
+           #     mode='min',
+           # )
+            ckpt
         ]
 
         tb_logger = TensorBoardLogger(
             save_dir=config.profiler_params.train_dir, name="", default_hp_metric=False)    
 
-        trainer = pl.Trainer(
-            gpus=config.setup.num_gpus,
-            precision=config.setup.precision,
-            callbacks=callbacks,
-            progress_bar_refresh_rate=1,
-            logger=tb_logger,
-            gradient_clip_val = config.optim_params.gradient_clip_val,
-            max_epochs=config.optim_params.max_epochs,
-            default_root_dir=config.profiler_params.train_dir,
-            min_epochs=config.optim_params.min_epochs,
-            resume_from_checkpoint = config.setup.checkpoint_path if config.setup.resume else None
-        )
+        if config.setup.deterministic:
+            trainer = pl.Trainer(
+                gpus=config.setup.num_gpus,
+                precision=config.setup.precision,
+                callbacks=callbacks,
+                progress_bar_refresh_rate=1,
+                logger=tb_logger,
+                gradient_clip_val = config.optim_params.gradient_clip_val,
+                max_epochs=config.optim_params.max_epochs,
+                default_root_dir=config.profiler_params.train_dir,
+                min_epochs=config.optim_params.min_epochs,
+                resume_from_checkpoint = config.setup.checkpoint_path if config.setup.resume else None
+                deterministic = True  # deterministic training
+            )
+        else:
+            trainer = pl.Trainer(
+                gpus=config.setup.num_gpus,
+                precision=config.setup.precision,
+                callbacks=callbacks,
+                progress_bar_refresh_rate=1,
+                logger=tb_logger,
+                gradient_clip_val = config.optim_params.gradient_clip_val,
+                max_epochs=config.optim_params.max_epochs,
+                default_root_dir=config.profiler_params.train_dir,
+                min_epochs=config.optim_params.min_epochs,
+                resume_from_checkpoint = config.setup.checkpoint_path if config.setup.resume else None
+            )
 
         print("Start training.")
         trainer.fit(model, data)
@@ -363,6 +346,8 @@ if __name__ == '__main__':
     print(soft_logo)
     configure = read_config(config_file_name='config.yaml')
     pprint.pprint(configure)
+    if configure.setup.deterministic:
+        pl.seed_everything(config.setup.random_seed, workers=True)
     #torch.autograd.set_detect_anomaly(True)
     #pl.utilities.seed.seed_everything(666)
     if configure.setup.ignore_warnings:

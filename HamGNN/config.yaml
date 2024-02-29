@@ -145,6 +145,8 @@ setup:
   accelerator: null
   ignore_warnings: true
   checkpoint_path: /public/home/zhangchengyan/workspace/HamGNN/data_user/test/cost_weight_exp/training_data/version_0/checkpoints/epoch=30-val_loss=0.000000.ckpt   #/public/home/zhangchengyan/workspace/HamGNN/data_user/test/training_data/version_3/checkpoints/epoch=17-val_loss=0.000000.ckpt  #/public/home/zhangchengyan/workspace/HamGNN/data_user/test/training_data/   # /public/home/wbchu/cwzhang/HamGNN/Si/fit3/version_0/checkpoints/epoch=409-val_loss=0.000000.ckpt
+  deterministic: true  # whether to impose reproducibility
+  random_seed: 42  # random seed, needed if deterministic=true
 
 
 
