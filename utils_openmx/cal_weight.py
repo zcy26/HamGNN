@@ -52,6 +52,7 @@ def calculate_weight(data_set, a="fit"):
     idx = 0
     for i in range(len(data_set)):
         weight_i = weights[idx: idx+n_edge_all[i]]
+        idx += n_edge_all[i]
         # assert len(weight_i) == data_set[i].edge_index.shape[1]
         data_set[i].weights = weight_i.reshape(-1, 1).contiguous()
         weighted_Hoff = (data_set[i].weights * data_set[i].Hoff)
