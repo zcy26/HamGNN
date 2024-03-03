@@ -248,13 +248,13 @@ def train_and_eval(config):
             gpus=config.setup.num_gpus,
             precision=config.setup.precision,
             callbacks=callbacks,
-            progress_bar_refresh_rate=1,
+            #progress_bar_refresh_rate=1,
             logger=tb_logger,
             gradient_clip_val = config.optim_params.gradient_clip_val,
             max_epochs=config.optim_params.max_epochs,
             default_root_dir=config.profiler_params.train_dir,
             min_epochs=config.optim_params.min_epochs,
-            resume_from_checkpoint = config.setup.checkpoint_path if config.setup.resume else None
+            #resume_from_checkpoint = config.setup.checkpoint_path if config.setup.resume else None
         )
 
         print("Start training.")
