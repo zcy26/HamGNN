@@ -44,6 +44,8 @@ git clone https://github.com/QuantumLab-ZY/HamGNN.git
 cd HamGNN
 python setup.py install
 ```
+Depending on the cuda version of the platform, it may be necessary to modify the version requirement of torch, pytorch_lightning, and torch_sparse, torch_scattering in the setup.py.
+
 
 ## Usage
 ### Preparation of Hamiltonian Training Data
