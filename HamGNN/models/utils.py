@@ -12,7 +12,10 @@ import torch.nn as nn
 import numpy as np
 from torch.nn import (Linear, Bilinear, Sigmoid, Softplus, ELU, ReLU, SELU, SiLU,
                       CELU, BatchNorm1d, ModuleList, Sequential, Tanh, BatchNorm1d as BN)
-from torch_geometric.nn.acts import swish
+try:
+    from torch_geometric.nn.acts import swish
+except ImportError:
+    from torch_geometric.nn.resolver import swish
 from typing import Callable, Union
 import re
 import torch.nn.functional as F

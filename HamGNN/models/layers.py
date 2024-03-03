@@ -16,7 +16,10 @@ from typing import Callable
 import sympy as sym
 import math
 from torch_geometric.nn.models.dimenet_utils import real_sph_harm
-from torch_geometric.nn.acts import swish
+try:
+    from torch_geometric.nn.acts import swish
+except ImportError:
+    from torch_geometric.nn.resolver import swish
 from torch.nn.init import xavier_uniform_
 from torch.nn.init import constant_
 from math import pi
